@@ -2,6 +2,11 @@ const Traitement = require('../models/Traitement');
 const Medicament = require('../models/Medicament');
 const { encrypt, decrypt } = require('../utils/encryption');
 const mongoose = require('mongoose');
+const Notification = require("../models/Notification");
+
+function isValidHoraire(horaire) {
+    return /^([01]\d|2[0-3]):([0-5]\d)$/.test(horaire);
+}
 
 // Helper to create medicaments
 const createMedicaments = async (medicamentsData, patientId) => {
@@ -23,33 +28,89 @@ const createMedicaments = async (medicamentsData, patientId) => {
 exports.ajouterTraitement = async (req, res) => {
   try {
     const medecinId = req.user._id;
-    const { nom, observations, medicaments } = req.body;
+    const { nom, observations, medicaments, patientId } = req.body;
 
+    console.log('Request body:', req.body); // Debug log
+
+    // Validate medicaments array
     if (!Array.isArray(medicaments) || medicaments.length === 0) {
       return res.status(400).json({ error: 'Medicaments must be a non-empty array' });
     }
 
+    // Validate patientId if provided
+    if (patientId && !mongoose.Types.ObjectId.isValid(patientId)) {
+      return res.status(400).json({ error: 'Invalid patient ID' });
+    }
+
+    // Encrypt observations
     const encryptedObservation = encrypt(observations || '');
 
-    const medicamentsList = await createMedicaments(medicaments, null); // No patient
+    // Create medicaments
+    const medicamentsList = await createMedicaments(medicaments, patientId || null);
 
+    // Create and save traitement
     const traitement = new Traitement({
       nom,
       observations: encryptedObservation,
-      patient: null, // Explicitly set to null
+      patient: patientId || null,
       medicaments: medicamentsList,
       medecin: medecinId,
     });
 
     await traitement.save();
+
+    // Generate notifications for each medicament if patientId is provided
+    if (patientId) {
+      for (const medicamentId of medicamentsList) {
+        const medicament = await Medicament.findById(medicamentId);
+        if (!medicament) {
+          console.error(`Medicament not found: ${medicamentId}`);
+          continue;
+        }
+
+        const notifications = [];
+        for (const horaire of medicament.horaires || []) {
+          if (!isValidHoraire(horaire)) {
+            console.error(`Invalid horaire for medicament ${medicament._id}: ${horaire}`);
+            continue;
+          }
+
+          const notification = new Notification({
+            contenu: `💊 Rappel : prenez ${medicament.nomCommercial} (${medicament.dosage})`,
+            type: 'rappel',
+            horaire,
+            patient: patientId,
+            medicament: medicament._id,
+            dateEnvoi: new Date(),
+            lu: false,
+          });
+
+          const savedNotification = await notification.save();
+          notifications.push(savedNotification._id);
+        }
+
+        // Update medicament with notification IDs
+        if (notifications.length > 0) {
+          medicament.notifications = [...(medicament.notifications || []), ...notifications];
+          await medicament.save();
+          console.log(`Notifications added to medicament ${medicament._id}:`, notifications);
+        }
+      }
+    } else {
+      console.log('No patientId provided, skipping notification creation');
+    }
+
+    // Fetch populated traitement
     const populatedTraitement = await Traitement.findById(traitement._id)
       .populate('medicaments')
       .populate('patient')
       .populate('medecin');
     const dechiffre = populatedTraitement.toObject();
     dechiffre.observations = dechiffre.observations ? decrypt(dechiffre.observations) : null;
+
     res.status(201).json(dechiffre);
   } catch (err) {
+    console.error('Error in ajouterTraitement:', err);
     res.status(400).json({ error: err.message });
   }
 };
@@ -174,15 +235,15 @@ exports.modifierTraitement = async (req, res) => {
       return res.status(404).json({ message: 'Traitement non trouvé' });
     }
 
-    const { nom, observations, medicaments, patient, medecin } = req.body;
+    const { nom, observations, medicaments, patientId } = req.body;
 
     // Use existing values if not provided
-    const updatePatient = patient !== undefined ? patient : traitement.patient;
-    const updateMedecin = medecin || traitement.medecin;
+    const updatePatient = patientId !== undefined ? patientId : traitement.patient;
+    const updateMedecin = req.body.medecin || traitement.medecin;
     const updateNom = nom || traitement.nom;
 
-    // Validate patient ID if provided
-    if (patient && !mongoose.Types.ObjectId.isValid(patient)) {
+    // Validate patientId if provided
+    if (patientId && !mongoose.Types.ObjectId.isValid(patientId)) {
       return res.status(400).json({ error: 'Invalid patient ID' });
     }
 
